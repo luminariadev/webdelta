@@ -4,6 +4,17 @@ All notable changes to `webdelta` are documented in this file.
 
 The format follows Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-11-26
+
+### Added
+
+- Embedded local web dashboard and REST API (`webdelta serve`) with live search filtering, manual checks, pause/resume watch toggles, colored unified diffs, inline SVG numeric sparklines, optional Bearer token auth (`--token` / `WEBDELTA_TOKEN`), and optional `--background-watch` scheduler.
+- History export across `json`, `csv` (RFC 4180), and `rss` (RSS 2.0 XML) via `webdelta export`, HTTP `/api/watches/{id}/export`, and MCP `export_history`.
+- Synthetic alert verification command (`webdelta test-notifier`) and MCP `test_notifier` tool.
+- Three new MCP tools (`update_watch`, `test_notifier`, `export_history`), MCP Resources (`webdelta://watches`, redacted `webdelta://config`, `webdelta://history/{watch_id}`, `webdelta://diff/{watch_id}`), and Streamable HTTP transport (`webdelta mcp --http` plus `/mcp` mounted inside `webdelta serve`).
+- Browser pre-extraction actions: `click_selector` and `scroll_to_bottom` across `BrowserOptions`, `BrowserConfig`, MCP schemas, and CLI (`--click-selector`, `--scroll-to-bottom`).
+- Multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `docs/docker.md`, and `.github/workflows/docker.yml` for GHCR container publishing.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

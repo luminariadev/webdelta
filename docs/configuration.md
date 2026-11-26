@@ -43,6 +43,8 @@ Optional settings used when `engine` is `"browser"` or `"auto"`. By default, `we
 | `wait_for_selector` | string | unset | Wait until `document.querySelector(...)` matches before capturing DOM HTML. |
 | `wait_ms` | integer | `0` | Extra milliseconds to wait after page load and selector match. |
 | `cdp_url` | string | unset | Remote CDP HTTP (`http://127.0.0.1:9222`) or WebSocket (`ws://...`) endpoint instead of launching a local browser. |
+| `click_selector` | string | unset | Click the first element matching this CSS selector before reading DOM HTML. |
+| `scroll_to_bottom` | boolean | `false` | Scroll to `document.body.scrollHeight` before reading DOM HTML. |
 
 ```toml
 [[watches]]
