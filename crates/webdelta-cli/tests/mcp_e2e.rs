@@ -132,7 +132,7 @@ fn test_mcp_stdio_end_to_end() {
         &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
     );
     let tools = list_tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 10);
 
     let preview_resp = send_and_recv(
         &mut stdin,
@@ -257,12 +257,91 @@ fn test_mcp_stdio_end_to_end() {
         serde_json::from_str(hist_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(hist_payload["count"], 2);
 
-    let remove_resp = send_and_recv(
+    let upd_resp = send_and_recv(
         &mut stdin,
         &mut reader,
         &json!({
             "jsonrpc": "2.0",
             "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "update_watch",
+                "arguments": { "id": "ssd-api", "interval": "10m", "name": "SSD Tracker" }
+            }
+        }),
+    );
+    assert_eq!(upd_resp["result"]["isError"], false);
+    let upd_payload: Value =
+        serde_json::from_str(upd_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(upd_payload["watch"]["interval"], "10m");
+    assert_eq!(upd_payload["watch"]["name"], "SSD Tracker");
+
+    let export_resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "export_history",
+                "arguments": { "watch_id": "ssd-api", "format": "csv" }
+            }
+        }),
+    );
+    assert_eq!(export_resp["result"]["isError"], false);
+    let export_payload: Value = serde_json::from_str(
+        export_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(export_payload["content"]
+        .as_str()
+        .unwrap()
+        .contains("149.5"));
+
+    let res_list = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &json!({ "jsonrpc": "2.0", "id": 12, "method": "resources/list" }),
+    );
+    assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 2);
+
+    let res_tmpls = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &json!({ "jsonrpc": "2.0", "id": 13, "method": "resources/templates/list" }),
+    );
+    assert_eq!(
+        res_tmpls["result"]["resourceTemplates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    for (req_id, uri, needle) in [
+        (14, "webdelta://watches", "ssd-api"),
+        (15, "webdelta://config", "SSD Tracker"),
+        (16, "webdelta://history/ssd-api", "149.5"),
+        (17, "webdelta://diff/ssd-api", "has_diff"),
+    ] {
+        let rr = send_and_recv(
+            &mut stdin,
+            &mut reader,
+            &json!({ "jsonrpc": "2.0", "id": req_id, "method": "resources/read", "params": { "uri": uri } }),
+        );
+        let txt = rr["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(txt.contains(needle), "resource {uri} missing '{needle}'");
+    }
+
+    let remove_resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 18,
             "method": "tools/call",
             "params": {
                 "name": "remove_watch",

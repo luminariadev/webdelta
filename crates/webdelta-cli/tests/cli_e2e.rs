@@ -156,6 +156,38 @@ fn test_cli_full_lifecycle() {
     let hist_json: Value = serde_json::from_slice(&hist_out.stdout).unwrap();
     assert_eq!(hist_json["count"], 2);
 
+    let csv_out = webdelta_cmd(&cfg, &db)
+        .args(["export", "product", "--format", "csv"])
+        .output()
+        .unwrap();
+    assert!(csv_out.status.success());
+    let csv_text = String::from_utf8_lossy(&csv_out.stdout);
+    assert!(csv_text.starts_with("checked_at,status_code,"));
+    assert!(csv_text.contains("$80.00"));
+
+    let rss_out = webdelta_cmd(&cfg, &db)
+        .args(["export", "product", "--format", "rss"])
+        .output()
+        .unwrap();
+    assert!(rss_out.status.success());
+    let rss_text = String::from_utf8_lossy(&rss_out.stdout);
+    assert!(rss_text.contains("<rss version=\"2.0\">"));
+
+    let cfg_body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!(
+            "{cfg_body}\n[notifiers.mock]\ntype = \"webhook\"\nurl = \"{}/webhook\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+
+    webdelta_cmd(&cfg, &db)
+        .args(["test-notifier", "mock", "--json"])
+        .assert()
+        .success();
+
     webdelta_cmd(&cfg, &db)
         .args(["remove", "product", "--purge-history"])
         .assert()

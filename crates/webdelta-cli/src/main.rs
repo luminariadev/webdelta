@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -9,10 +10,13 @@ use serde_json::json;
 use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 use webdelta_core::{
-    compute_delta, compute_diff, load_config, save_config, starter_config_toml, BrowserConfig,
-    CheckOutcome, CheckStatus, ConditionConfig, Config, Error, ExtractorConfig, FetchEngine,
-    HttpMethod, MonitorEngine, NormalizeConfig, Result, StateStore, WatchConfig,
+    compute_delta, compute_diff, export_history, load_config, save_config, starter_config_toml,
+    test_notifier, BrowserConfig, CheckOutcome, CheckStatus, ConditionConfig, Config, Error,
+    ExportFormat, ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, Result,
+    StateStore, WatchConfig,
 };
+
+mod server;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,8 +107,60 @@ enum Commands {
         concurrency: Option<usize>,
     },
 
-    /// Start a Model Context Protocol stdio server
-    Mcp,
+    /// Export stored snapshot history as JSON, CSV, or RSS XML
+    Export {
+        id: String,
+        #[arg(
+            long,
+            default_value = "json",
+            help = "Export format: json, csv, or rss"
+        )]
+        format: String,
+        #[arg(long, default_value_t = 100, help = "Maximum snapshots to export")]
+        limit: usize,
+        #[arg(short = 'o', long, help = "Optional output file path")]
+        output: Option<PathBuf>,
+    },
+
+    /// Send a synthetic test alert through a configured notifier
+    TestNotifier { name: String },
+
+    /// Start the embedded local web dashboard, REST API, and HTTP MCP server
+    Serve {
+        #[arg(
+            long,
+            default_value = "127.0.0.1:8787",
+            help = "Host and port to bind the HTTP server"
+        )]
+        bind: String,
+        #[arg(
+            long,
+            help = "Optional bearer token (falls back to WEBDELTA_TOKEN env var)"
+        )]
+        token: Option<String>,
+        #[arg(
+            long = "background-watch",
+            help = "Run the interval polling scheduler alongside the web dashboard"
+        )]
+        background_watch: bool,
+        #[arg(long, help = "Override maximum concurrent HTTP requests")]
+        concurrency: Option<usize>,
+    },
+
+    /// Start a Model Context Protocol server (stdio by default, or Streamable HTTP)
+    Mcp {
+        #[arg(
+            long,
+            value_name = "BIND",
+            help = "Serve Streamable HTTP MCP on <HOST:PORT> instead of stdio"
+        )]
+        http: Option<String>,
+        #[arg(
+            long,
+            help = "Optional bearer token for HTTP MCP (falls back to WEBDELTA_MCP_TOKEN)"
+        )]
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -190,6 +246,18 @@ struct BrowserCliArgs {
         help = "Optional remote CDP HTTP or WebSocket endpoint"
     )]
     cdp_url: Option<String>,
+
+    #[arg(
+        long = "click-selector",
+        help = "Click CSS selector before reading DOM in browser mode"
+    )]
+    click_selector: Option<String>,
+
+    #[arg(
+        long = "scroll-to-bottom",
+        help = "Scroll to page bottom before reading DOM in browser mode"
+    )]
+    scroll_to_bottom: bool,
 }
 
 impl BrowserCliArgs {
@@ -198,6 +266,8 @@ impl BrowserCliArgs {
             wait_for_selector: self.wait_selector.clone(),
             wait_ms: self.wait_ms,
             cdp_url: self.cdp_url.clone(),
+            click_selector: self.click_selector.clone(),
+            scroll_to_bottom: self.scroll_to_bottom,
         }
     }
 }
@@ -338,8 +408,47 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Diff { id, context } => cmd_diff(&cli, id, *context),
         Commands::History { id, limit } => cmd_history(&cli, id, *limit),
         Commands::Watch { concurrency } => cmd_watch(&cli, *concurrency).await,
-        Commands::Mcp => {
-            webdelta_mcp::run_stdio(cli.config, cli.db).await?;
+        Commands::Export {
+            id,
+            format,
+            limit,
+            output,
+        } => cmd_export(&cli, id, format, *limit, output.as_ref()),
+        Commands::TestNotifier { name } => cmd_test_notifier(&cli, name).await,
+        Commands::Serve {
+            bind,
+            token,
+            background_watch,
+            concurrency,
+        } => {
+            let resolved_token = token.clone().or_else(|| {
+                std::env::var("WEBDELTA_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+            server::run_serve(
+                cli.config,
+                cli.db,
+                bind,
+                resolved_token,
+                *background_watch,
+                *concurrency,
+            )
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Mcp { http, token } => {
+            if let Some(bind) = http {
+                let resolved_token = token.clone().or_else(|| {
+                    std::env::var("WEBDELTA_MCP_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                });
+                println!("webdelta MCP HTTP server listening on http://{bind}/mcp");
+                webdelta_mcp::run_http(cli.config, cli.db, bind, resolved_token).await?;
+            } else {
+                webdelta_mcp::run_stdio(cli.config, cli.db).await?;
+            }
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -776,6 +885,91 @@ fn cmd_history(cli: &Cli, id: &str, limit: usize) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_export(
+    cli: &Cli,
+    id: &str,
+    format_str: &str,
+    limit: usize,
+    output: Option<&PathBuf>,
+) -> Result<ExitCode> {
+    let format = ExportFormat::from_str(format_str)?;
+    let config = if cli.config.exists() {
+        load_config(&cli.config)?
+    } else {
+        Config::default()
+    };
+    let watch = config.watches.iter().find(|w| w.id == id);
+
+    let records = if cli.db.exists() {
+        let store = StateStore::open(&cli.db)?;
+        store.get_history(id, limit.clamp(1, 500))?
+    } else {
+        Vec::new()
+    };
+
+    let exported = export_history(watch, id, &records, format)?;
+
+    if let Some(out_path) = output {
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out_path, &exported)?;
+        if cli.json {
+            print_json(&json!({
+                "watch_id": id,
+                "format": format_str,
+                "count": records.len(),
+                "output": out_path.display().to_string(),
+            }));
+        } else {
+            println!(
+                "Exported {} record(s) for '{}' to {}",
+                records.len(),
+                id,
+                out_path.display()
+            );
+        }
+    } else {
+        print!("{exported}");
+        if !exported.ends_with('\n') {
+            println!();
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn cmd_test_notifier(cli: &Cli, name: &str) -> Result<ExitCode> {
+    let config = load_config(&cli.config)?;
+    let res = test_notifier(&config.notifiers, name).await;
+
+    if cli.json {
+        print_json(&res);
+    } else if res.ok {
+        println!(
+            "Test notification delivered via '{}' ({}, HTTP {})",
+            res.notifier,
+            res.kind,
+            res.status_code.unwrap_or(200)
+        );
+    } else {
+        eprintln!(
+            "Test notification failed for '{}' ({}): {}",
+            res.notifier,
+            res.kind,
+            res.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+
+    if res.ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
 
 async fn cmd_watch(cli: &Cli, concurrency_override: Option<usize>) -> Result<ExitCode> {
