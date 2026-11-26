@@ -1,0 +1,23 @@
+[package]
+name = "webdelta-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Model Context Protocol stdio server for webdelta"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webdelta-core = { path = "../webdelta-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
