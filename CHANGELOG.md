@@ -4,6 +4,22 @@ All notable changes to `webdelta` are documented in this file.
 
 The format follows Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.0] - 2026-11-26
+
+### Added
+
+- New `webdelta-browser` crate implementing a pure-Rust Chrome DevTools Protocol (CDP) renderer over WebSocket (`tokio-tungstenite`), supporting local Chrome/Edge/Chromium auto-discovery (`WEBDELTA_BROWSER_PATH` override) and remote `cdp_url` endpoints.
+- Hybrid `engine` mode (`http`, `browser`, `auto`) across `WatchConfig`, `MonitorEngine`, MCP tools (`add_watch`, `preview_extract`, `list_watches`), and CLI (`--engine`, `--wait-selector`, `--wait-ms`, `--cdp-url`).
+- Custom `-H` / `--request-header` flag on `webdelta preview`.
+- SPA shell detection (`looks_like_spa_shell`) and offline JS/SPA CDP integration tests.
+- Reproducible performance and memory benchmarks in `docs/benchmarks.md` plus `examples/spa-browser.toml`.
+- Project status, release, license, MSRV, and MCP badges in `README.md`.
+
+### Fixed
+
+- Tightened `parse_numeric` to ignore semver tags (`v0.1.0`), IPv4 addresses, dates, and alphanumeric identifiers (`h1`, `sha256`) while preserving currency and European/Indonesian separator parsing.
+- Scoped `--verbose` (`-v`) tracing logs to `webdelta_*` crates instead of emitting third-party HTML parser debug noise.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

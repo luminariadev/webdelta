@@ -1,0 +1,43 @@
+# Monitor JavaScript-rendered Single Page Applications (SPAs) with automatic or explicit CDP rendering.
+
+[defaults]
+interval = "30m"
+timeout_secs = 25
+retries = 1
+max_history = 100
+concurrency = 4
+
+# `engine = "auto"` tries fast native HTTP first and falls back to headless Chromium/Edge
+# only when the HTML looks like an unrendered SPA shell or the CSS selector yields no match.
+[[watches]]
+id = "spa-pricing"
+name = "SPA Pricing Card"
+url = "https://app.example.com/pricing"
+engine = "auto"
+
+[watches.browser]
+wait_for_selector = ".pricing-tier .amount"
+wait_ms = 250
+
+[watches.extractor]
+type = "css"
+selector = ".pricing-tier .amount"
+
+[[watches.conditions]]
+type = "drop_pct_at_least"
+percent = 10.0
+
+# `engine = "browser"` always renders through CDP (optionally via a remote CDP service).
+[[watches]]
+id = "dashboard-banner"
+name = "Client Dashboard Status"
+url = "https://status.example.com"
+engine = "browser"
+
+[watches.browser]
+wait_for_selector = "[data-status-ready='true']"
+# cdp_url = "http://127.0.0.1:9222"
+
+[watches.extractor]
+type = "css"
+selector = ".system-status"

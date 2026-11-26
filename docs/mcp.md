@@ -35,20 +35,26 @@ Any MCP-compatible client can register `webdelta` with a standard server entry:
 
 | Tool | Required Args | Optional Args | Description |
 | :--- | :--- | :--- | :--- |
-| `list_watches` | none | `include_disabled` | List configured watches and their latest recorded snapshots. |
-| `add_watch` | `id`, `url` | `name`, `interval`, `extractor_type`, `selector`, `attribute`, `all`, `path`, `pattern`, `group`, `header`, `ignore_regex`, `conditions`, `notifiers` | Validate and add a new watch to `webdelta.toml`. |
+| `list_watches` | none | `include_disabled` | List configured watches, engine modes, and their latest recorded snapshots. |
+| `add_watch` | `id`, `url` | `name`, `interval`, `engine`, `wait_for_selector`, `wait_ms`, `cdp_url`, `extractor_type`, `selector`, `attribute`, `all`, `path`, `pattern`, `group`, `header`, `ignore_regex`, `conditions`, `notifiers` | Validate and add a new watch to `webdelta.toml`. |
 | `remove_watch` | `id` | `purge_history` | Remove a watch from config and optionally delete stored snapshots. |
 | `check_now` | none | `watch_id`, `notify` | Check one watch or all enabled watches immediately (`notify` defaults to `false`). |
 | `get_diff` | `watch_id` | `context_lines` | Return the unified diff and numeric delta between the two most recent snapshots. |
 | `get_history` | `watch_id` | `limit` | Return stored snapshot history ordered newest first (default `10`, max `500`). |
-| `preview_extract` | `url` | `extractor_type`, `selector`, `attribute`, `all`, `path`, `pattern`, `group`, `header`, `ignore_regex`, `timeout_secs` | Fetch a URL once and return extracted text and parsed number without saving state. |
+| `preview_extract` | `url` | `engine`, `wait_for_selector`, `wait_ms`, `cdp_url`, `extractor_type`, `selector`, `attribute`, `all`, `path`, `pattern`, `group`, `header`, `ignore_regex`, `timeout_secs` | Fetch or render a URL once and return extracted text and parsed number without saving state. |
 
-## Example Tool Call
+## Example Tool Calls
 
-Request over `stdin`:
+JSON API preview over `stdin`:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"preview_extract","arguments":{"url":"https://api.example.com/v1/meta","extractor_type":"json_path","path":"$.version"}}}
 ```
 
-The tool returns JSON inside `result.content[0].text` containing `url`, `status_code`, `elapsed_ms`, `extracted_text`, `numeric_value`, and `content_hash`.
+Client-rendered SPA preview using `auto` fallback to headless CDP:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"preview_extract","arguments":{"url":"https://app.example.com/pricing","engine":"auto","wait_for_selector":".price","extractor_type":"css","selector":".price"}}}
+```
+
+Each tool returns JSON inside `result.content[0].text` including `url`, `engine_used`, `status_code`, `elapsed_ms`, `extracted_text`, `numeric_value`, and `content_hash`.

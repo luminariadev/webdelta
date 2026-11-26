@@ -29,9 +29,37 @@ Each `[[watches]]` block defines one monitored URL or endpoint.
 | `interval` | string | No | Overrides `defaults.interval` for this watch. |
 | `timeout_secs` | integer | No | Overrides `defaults.timeout_secs`. |
 | `retries` | integer | No | Overrides `defaults.retries`. |
+| `engine` | string | No | Fetch engine: `"http"` (default), `"browser"` (headless CDP), or `"auto"` (HTTP with SPA browser fallback). |
 | `ignore_regex` | array of strings | No | Regular expressions stripped from extracted text before comparison. |
 | `notifiers` | array of strings | No | Names referencing entries in `[notifiers]`. |
 | `enabled` | boolean | No | Set to `false` to skip during scheduled or batch checks. Defaults to `true`. |
+
+## `[watches.browser]`
+
+Optional settings used when `engine` is `"browser"` or `"auto"`. By default, `webdelta` locates Chrome, Edge, or Chromium locally (or uses `WEBDELTA_BROWSER_PATH`).
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `wait_for_selector` | string | unset | Wait until `document.querySelector(...)` matches before capturing DOM HTML. |
+| `wait_ms` | integer | `0` | Extra milliseconds to wait after page load and selector match. |
+| `cdp_url` | string | unset | Remote CDP HTTP (`http://127.0.0.1:9222`) or WebSocket (`ws://...`) endpoint instead of launching a local browser. |
+
+```toml
+[[watches]]
+id = "spa-pricing"
+url = "https://app.example.com/pricing"
+engine = "auto"
+
+[watches.browser]
+wait_for_selector = ".plan-card .price"
+wait_ms = 250
+
+[watches.extractor]
+type = "css"
+selector = ".plan-card .price"
+```
+
+See [examples/spa-browser.toml](../examples/spa-browser.toml) for a complete example.
 
 ## `[watches.extractor]`
 
