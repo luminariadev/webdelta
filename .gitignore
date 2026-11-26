@@ -1,0 +1,12 @@
+/target
+.webdelta/
+*.redb
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.claude/
+.cursor/
+.agent/
+.windsurf/
+.gemini/
