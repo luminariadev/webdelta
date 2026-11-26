@@ -1,0 +1,13 @@
+services:
+  webdelta:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      - WEBDELTA_TOKEN=${WEBDELTA_TOKEN:-}
+      - WEBDELTA_WEBHOOK_SECRET=${WEBDELTA_WEBHOOK_SECRET:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
