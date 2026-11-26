@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 use webdelta_core::{
-    compute_delta, compute_diff, load_config, save_config, starter_config_toml, CheckOutcome,
-    CheckStatus, ConditionConfig, Config, Error, ExtractorConfig, HttpMethod, MonitorEngine,
-    NormalizeConfig, Result, StateStore, WatchConfig,
+    compute_delta, compute_diff, load_config, save_config, starter_config_toml, BrowserConfig,
+    CheckOutcome, CheckStatus, ConditionConfig, Config, Error, ExtractorConfig, FetchEngine,
+    HttpMethod, MonitorEngine, NormalizeConfig, Result, StateStore, WatchConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -145,6 +145,63 @@ struct ExtractorCliArgs {
     ignore_regex: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum CliEngine {
+    #[default]
+    Http,
+    Browser,
+    Auto,
+}
+
+impl From<CliEngine> for FetchEngine {
+    fn from(value: CliEngine) -> Self {
+        match value {
+            CliEngine::Http => Self::Http,
+            CliEngine::Browser => Self::Browser,
+            CliEngine::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct BrowserCliArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliEngine::Http,
+        help = "Fetch engine: http, browser (headless CDP), or auto"
+    )]
+    engine: CliEngine,
+
+    #[arg(
+        long = "wait-selector",
+        help = "Wait for CSS selector before reading DOM in browser mode"
+    )]
+    wait_selector: Option<String>,
+
+    #[arg(
+        long = "wait-ms",
+        help = "Extra delay in milliseconds after page load in browser mode"
+    )]
+    wait_ms: Option<u64>,
+
+    #[arg(
+        long = "cdp-url",
+        help = "Optional remote CDP HTTP or WebSocket endpoint"
+    )]
+    cdp_url: Option<String>,
+}
+
+impl BrowserCliArgs {
+    fn to_browser_config(&self) -> BrowserConfig {
+        BrowserConfig {
+            wait_for_selector: self.wait_selector.clone(),
+            wait_ms: self.wait_ms,
+            cdp_url: self.cdp_url.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct AddArgs {
     id: String,
@@ -158,6 +215,9 @@ struct AddArgs {
 
     #[command(flatten)]
     extractor: ExtractorCliArgs,
+
+    #[command(flatten)]
+    browser: BrowserCliArgs,
 
     #[arg(
         long = "contains",
@@ -206,7 +266,17 @@ struct PreviewArgs {
     #[command(flatten)]
     extractor: ExtractorCliArgs,
 
-    #[arg(long, default_value_t = 15, help = "HTTP request timeout in seconds")]
+    #[command(flatten)]
+    browser: BrowserCliArgs,
+
+    #[arg(
+        short = 'H',
+        long = "request-header",
+        help = "Extra HTTP request header formatted as 'Key: Value'"
+    )]
+    request_headers: Vec<String>,
+
+    #[arg(long, default_value_t = 15, help = "Request timeout in seconds")]
     timeout: u64,
 }
 
@@ -243,7 +313,11 @@ async fn main() -> ExitCode {
 }
 
 fn init_tracing(verbose: bool) {
-    let level = if verbose { "debug" } else { "warn" };
+    let level = if verbose {
+        "warn,webdelta_core=debug,webdelta_browser=debug,webdelta_mcp=debug,webdelta=debug"
+    } else {
+        "warn"
+    };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -371,6 +445,8 @@ fn cmd_add(cli: &Cli, args: &AddArgs) -> Result<ExitCode> {
         interval: args.interval.clone(),
         timeout_secs: None,
         retries: None,
+        engine: args.browser.engine.into(),
+        browser: args.browser.to_browser_config(),
         extractor,
         ignore_regex: args.extractor.ignore_regex.clone(),
         normalize: NormalizeConfig::default(),
@@ -421,6 +497,7 @@ fn cmd_list(cli: &Cli) -> Result<ExitCode> {
                     "url": w.url,
                     "interval": w.interval.as_deref().unwrap_or(&config.defaults.interval),
                     "enabled": w.enabled,
+                    "engine": w.engine,
                     "extractor": w.extractor,
                     "latest": latest,
                 })
@@ -513,12 +590,17 @@ fn cmd_remove(cli: &Cli, id: &str, purge_history: bool) -> Result<ExitCode> {
 
 async fn cmd_preview(cli: &Cli, args: &PreviewArgs) -> Result<ExitCode> {
     let extractor = build_extractor_from_cli(&args.extractor)?;
+    let headers = parse_header_pairs(&args.request_headers)?;
+    let browser = args.browser.to_browser_config();
     let preview = MonitorEngine::preview(
         &args.url,
         &extractor,
         &args.extractor.ignore_regex,
         &NormalizeConfig::default(),
         args.timeout,
+        args.browser.engine.into(),
+        &browser,
+        &headers,
     )
     .await?;
 
@@ -526,7 +608,10 @@ async fn cmd_preview(cli: &Cli, args: &PreviewArgs) -> Result<ExitCode> {
         print_json(&preview);
     } else {
         println!("URL: {}", preview.url);
-        println!("HTTP: {} ({} ms)", preview.status_code, preview.elapsed_ms);
+        println!(
+            "HTTP: {} ({}, {} ms)",
+            preview.status_code, preview.engine_used, preview.elapsed_ms
+        );
         if let Some(num) = preview.numeric_value {
             println!("Numeric: {}", format_number(num));
         }
@@ -774,6 +859,26 @@ async fn cmd_watch(cli: &Cli, concurrency_override: Option<usize>) -> Result<Exi
     Ok(ExitCode::SUCCESS)
 }
 
+fn parse_header_pairs(raw: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut headers = BTreeMap::new();
+    for item in raw {
+        let Some((key, val)) = item.split_once(':') else {
+            return Err(Error::Validation(format!(
+                "invalid header '{item}': expected 'Key: Value'"
+            )));
+        };
+        let key = key.trim();
+        let val = val.trim();
+        if key.is_empty() {
+            return Err(Error::Validation(format!(
+                "invalid header '{item}': header name must not be empty"
+            )));
+        }
+        headers.insert(key.to_string(), val.to_string());
+    }
+    Ok(headers)
+}
+
 fn build_extractor_from_cli(args: &ExtractorCliArgs) -> Result<ExtractorConfig> {
     if let Some(selector) = &args.css {
         return Ok(ExtractorConfig::Css {
@@ -805,10 +910,15 @@ fn print_outcome_human(outcome: &CheckOutcome) {
         .status_code
         .map(|c| format!("HTTP {c}"))
         .unwrap_or_else(|| "no HTTP".to_string());
+    let engine_suffix = if outcome.engine_used == "browser" {
+        ", browser"
+    } else {
+        ""
+    };
 
     println!(
-        "[{}] {} ({}, {}ms)",
-        status_label, outcome.watch_id, code_label, outcome.elapsed_ms
+        "[{}] {} ({}{}, {}ms)",
+        status_label, outcome.watch_id, code_label, engine_suffix, outcome.elapsed_ms
     );
 
     if let Some(err) = &outcome.error {

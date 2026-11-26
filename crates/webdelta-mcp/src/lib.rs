@@ -8,8 +8,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use webdelta_core::{
-    compute_delta, compute_diff, load_config, save_config, ConditionConfig, Config, Error,
-    ExtractorConfig, HttpMethod, MonitorEngine, NormalizeConfig, Result, StateStore, WatchConfig,
+    compute_delta, compute_diff, load_config, save_config, BrowserConfig, ConditionConfig, Config,
+    Error, ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, Result,
+    StateStore, WatchConfig,
 };
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -254,6 +255,7 @@ impl McpServer {
                 "url": watch.url,
                 "interval": watch.interval.as_deref().unwrap_or(&config.defaults.interval),
                 "enabled": watch.enabled,
+                "engine": watch.engine,
                 "extractor": watch.extractor,
                 "conditions": watch.conditions,
                 "notifiers": watch.notifiers,
@@ -277,6 +279,14 @@ impl McpServer {
             name: Option<String>,
             #[serde(default)]
             interval: Option<String>,
+            #[serde(default)]
+            engine: FetchEngine,
+            #[serde(default)]
+            wait_for_selector: Option<String>,
+            #[serde(default)]
+            wait_ms: Option<u64>,
+            #[serde(default)]
+            cdp_url: Option<String>,
             #[serde(flatten)]
             extractor: ExtractorParams,
             #[serde(default)]
@@ -307,6 +317,12 @@ impl McpServer {
             interval: parsed.interval,
             timeout_secs: None,
             retries: None,
+            engine: parsed.engine,
+            browser: BrowserConfig {
+                wait_for_selector: parsed.wait_for_selector,
+                wait_ms: parsed.wait_ms,
+                cdp_url: parsed.cdp_url,
+            },
             extractor,
             ignore_regex: parsed.ignore_regex,
             normalize: NormalizeConfig::default(),
@@ -446,6 +462,14 @@ impl McpServer {
         #[derive(Deserialize)]
         struct Args {
             url: String,
+            #[serde(default)]
+            engine: FetchEngine,
+            #[serde(default)]
+            wait_for_selector: Option<String>,
+            #[serde(default)]
+            wait_ms: Option<u64>,
+            #[serde(default)]
+            cdp_url: Option<String>,
             #[serde(flatten)]
             extractor: ExtractorParams,
             #[serde(default)]
@@ -455,12 +479,20 @@ impl McpServer {
         }
         let parsed: Args = parse_args(args)?;
         let extractor = build_extractor(&parsed.extractor)?;
+        let browser = BrowserConfig {
+            wait_for_selector: parsed.wait_for_selector,
+            wait_ms: parsed.wait_ms,
+            cdp_url: parsed.cdp_url,
+        };
         let result = MonitorEngine::preview(
             &parsed.url,
             &extractor,
             &parsed.ignore_regex,
             &NormalizeConfig::default(),
             parsed.timeout_secs,
+            parsed.engine,
+            &browser,
+            &BTreeMap::new(),
         )
         .await?;
 
@@ -594,6 +626,14 @@ fn tool_definitions() -> Value {
                     "url": { "type": "string", "description": "Target HTTP or HTTPS URL." },
                     "name": { "type": "string", "description": "Optional human-friendly display name." },
                     "interval": { "type": "string", "description": "Polling interval such as '15m', '1h', or '30s'." },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["http", "browser", "auto"],
+                        "description": "Fetch engine: 'http' (default), 'browser' (headless CDP), or 'auto' (HTTP with SPA browser fallback)."
+                    },
+                    "wait_for_selector": { "type": "string", "description": "CSS selector to wait for when using 'browser' or 'auto' engine." },
+                    "wait_ms": { "type": "integer", "description": "Extra milliseconds to wait after page load in browser mode." },
+                    "cdp_url": { "type": "string", "description": "Optional remote CDP HTTP or WebSocket URL." },
                     "extractor_type": {
                         "type": "string",
                         "enum": ["text", "css", "json_path", "regex", "status"],
@@ -679,6 +719,14 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Target HTTP or HTTPS URL." },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["http", "browser", "auto"],
+                        "description": "Fetch engine: 'http' (default), 'browser' (headless CDP), or 'auto' (HTTP with SPA browser fallback)."
+                    },
+                    "wait_for_selector": { "type": "string" },
+                    "wait_ms": { "type": "integer" },
+                    "cdp_url": { "type": "string" },
                     "extractor_type": {
                         "type": "string",
                         "enum": ["text", "css", "json_path", "regex", "status"]
