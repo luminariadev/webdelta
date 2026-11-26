@@ -106,6 +106,10 @@ pub struct BrowserConfig {
     pub wait_ms: Option<u64>,
     #[serde(default)]
     pub cdp_url: Option<String>,
+    #[serde(default)]
+    pub click_selector: Option<String>,
+    #[serde(default)]
+    pub scroll_to_bottom: bool,
 }
 
 /// Configuration for a single monitored URL or API endpoint.
@@ -614,6 +618,13 @@ fn validate_browser_config(watch_id: &str, browser: &BrowserConfig) -> Result<()
             ))
         })?;
     }
+    if let Some(click_selector) = &browser.click_selector {
+        Selector::parse(click_selector).map_err(|err| {
+            Error::Validation(format!(
+                "watch '{watch_id}' has invalid browser.click_selector '{click_selector}': {err:?}"
+            ))
+        })?;
+    }
     if let Some(cdp_url) = &browser.cdp_url {
         let trimmed = cdp_url.trim();
         if !trimmed.contains("${") {
@@ -667,6 +678,60 @@ fn validate_condition(watch_id: &str, condition: &ConditionConfig) -> Result<()>
                 )));
             }
             Ok(())
+        }
+    }
+}
+
+/// Returns a TOML representation of `config` with literal notifier secrets and sensitive headers redacted.
+pub fn redact_config_toml(config: &Config) -> Result<String> {
+    let mut redacted = config.clone();
+
+    for notifier in redacted.notifiers.values_mut() {
+        match notifier {
+            NotifierConfig::Webhook {
+                headers, secret, ..
+            } => {
+                if let Some(s) = secret.as_mut() {
+                    redact_literal_secret(s);
+                }
+                redact_sensitive_headers(headers);
+            }
+            NotifierConfig::Telegram { bot_token, .. } => {
+                redact_literal_secret(bot_token);
+            }
+            NotifierConfig::Discord { webhook_url } | NotifierConfig::Slack { webhook_url } => {
+                redact_literal_secret(webhook_url);
+            }
+            NotifierConfig::Ntfy { token, .. } => {
+                if let Some(t) = token.as_mut() {
+                    redact_literal_secret(t);
+                }
+            }
+        }
+    }
+
+    for watch in &mut redacted.watches {
+        redact_sensitive_headers(&mut watch.headers);
+    }
+
+    toml::to_string_pretty(&redacted)
+        .map_err(|err| Error::Config(format!("failed to serialize redacted config: {err}")))
+}
+
+fn redact_literal_secret(val: &mut String) {
+    if !val.trim().is_empty() && !val.contains("${") {
+        *val = "<redacted>".to_string();
+    }
+}
+
+fn redact_sensitive_headers(headers: &mut BTreeMap<String, String>) {
+    for (k, v) in headers.iter_mut() {
+        let lower = k.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "authorization" | "cookie" | "x-api-key" | "x-auth-token"
+        ) {
+            redact_literal_secret(v);
         }
     }
 }
@@ -762,5 +827,39 @@ mod tests {
             enabled: true,
         });
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_redact_config_toml_preserves_env_placeholders_and_redacts_literals() {
+        let mut cfg = Config::default();
+        cfg.notifiers.insert(
+            "hook".to_string(),
+            NotifierConfig::Webhook {
+                url: "https://example.com/hook".to_string(),
+                headers: BTreeMap::from([
+                    (
+                        "Authorization".to_string(),
+                        "Bearer literal-token".to_string(),
+                    ),
+                    ("X-Custom".to_string(), "public".to_string()),
+                ]),
+                secret: Some("literal-secret".to_string()),
+            },
+        );
+        cfg.notifiers.insert(
+            "tg".to_string(),
+            NotifierConfig::Telegram {
+                bot_token: "${TELEGRAM_BOT_TOKEN}".to_string(),
+                chat_id: "12345".to_string(),
+                api_base_url: None,
+            },
+        );
+
+        let redacted = redact_config_toml(&cfg).unwrap();
+        assert!(!redacted.contains("literal-secret"));
+        assert!(!redacted.contains("literal-token"));
+        assert!(redacted.contains("<redacted>"));
+        assert!(redacted.contains("${TELEGRAM_BOT_TOKEN}"));
+        assert!(redacted.contains("public"));
     }
 }

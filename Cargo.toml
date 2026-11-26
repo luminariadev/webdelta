@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -21,6 +21,7 @@ all = "warn"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "io-std", "io-util", "net", "sync", "process"] }
+axum = "0.8"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "gzip", "deflate"] }

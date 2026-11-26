@@ -7,9 +7,9 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use webdelta_core::{
-    discover_browser_binary, BrowserConfig, CheckStatus, ConditionConfig, Config, DefaultsConfig,
-    ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, NotifierConfig,
-    StateStore, WatchConfig,
+    discover_browser_binary, test_notifier, BrowserConfig, CheckStatus, ConditionConfig, Config,
+    DefaultsConfig, ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig,
+    NotifierConfig, StateStore, WatchConfig,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -408,6 +408,8 @@ async fn test_spa_page_rendered_via_browser_and_auto_engines() {
             wait_for_selector: Some(".price".to_string()),
             wait_ms: None,
             cdp_url: None,
+            click_selector: None,
+            scroll_to_bottom: false,
         },
         extractor: ExtractorConfig::Css {
             selector: ".price".to_string(),
@@ -448,5 +450,66 @@ async fn test_spa_page_rendered_via_browser_and_auto_engines() {
         assert_eq!(auto_res.engine_used, "browser");
         assert_eq!(auto_res.current_value.as_deref(), Some("$249.00"));
         assert_eq!(auto_res.numeric_value, Some(249.0));
+    }
+}
+
+#[tokio::test]
+async fn test_browser_click_selector_and_test_notifier() {
+    let click_html = r#"<!doctype html>
+<html>
+  <body>
+    <button id="reveal-btn" onclick="document.getElementById('out').innerHTML = '<span class=\'deal\'>$179.00</span>';">Reveal</button>
+    <div id="out"></div>
+  </body>
+</html>"#;
+
+    let state = Arc::new(Mutex::new(MockState {
+        html_body: click_html.to_string(),
+        etag: "\"clk1\"".to_string(),
+        ..Default::default()
+    }));
+    let base_url = start_mock_server(Arc::clone(&state)).await;
+
+    let mut notifiers = BTreeMap::new();
+    notifiers.insert(
+        "hook".to_string(),
+        NotifierConfig::Webhook {
+            url: format!("{base_url}/webhook"),
+            headers: BTreeMap::new(),
+            secret: None,
+        },
+    );
+
+    let notif_res = test_notifier(&notifiers, "hook").await;
+    assert!(notif_res.ok, "{notif_res:?}");
+    assert_eq!(notif_res.status_code, Some(200));
+    assert_eq!(state.lock().unwrap().webhooks.len(), 1);
+
+    if discover_browser_binary().is_some() {
+        let preview = MonitorEngine::preview(
+            &format!("{base_url}/click"),
+            &ExtractorConfig::Css {
+                selector: ".deal".to_string(),
+                attribute: None,
+                all: false,
+            },
+            &[],
+            &NormalizeConfig::default(),
+            20,
+            FetchEngine::Browser,
+            &BrowserConfig {
+                wait_for_selector: Some("#reveal-btn".to_string()),
+                wait_ms: None,
+                cdp_url: None,
+                click_selector: Some("#reveal-btn".to_string()),
+                scroll_to_bottom: false,
+            },
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview.engine_used, "browser");
+        assert_eq!(preview.extracted_text, "$179.00");
+        assert_eq!(preview.numeric_value, Some(179.0));
     }
 }

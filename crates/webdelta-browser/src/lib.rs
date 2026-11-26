@@ -52,6 +52,8 @@ pub struct BrowserOptions {
     pub executable_path: Option<String>,
     pub wait_for_selector: Option<String>,
     pub wait_ms: u64,
+    pub click_selector: Option<String>,
+    pub scroll_to_bottom: bool,
     pub timeout_secs: u64,
     pub user_agent: Option<String>,
     pub headers: BTreeMap<String, String>,
@@ -64,6 +66,8 @@ impl Default for BrowserOptions {
             executable_path: None,
             wait_for_selector: None,
             wait_ms: 0,
+            click_selector: None,
+            scroll_to_bottom: false,
             timeout_secs: 20,
             user_agent: None,
             headers: BTreeMap::new(),
@@ -724,6 +728,36 @@ async fn drive_cdp_page(
             let remaining = remaining_duration(deadline)?;
             tokio::time::sleep(remaining.min(Duration::from_millis(75))).await;
         }
+    }
+
+    if let Some(click_sel) = &opts.click_selector {
+        let escaped = serde_json::to_string(click_sel)
+            .map_err(|err| BrowserError::InvalidConfig(format!("invalid click_selector: {err}")))?;
+        let click_expr = format!("(() => {{ const el = document.querySelector({escaped}); if (el) {{ el.click(); return true; }} return false; }})()");
+        let _ = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": click_expr, "returnByValue": true }),
+                deadline,
+            )
+            .await?;
+        let remaining = remaining_duration(deadline)?;
+        tokio::time::sleep(remaining.min(Duration::from_millis(150))).await;
+    }
+
+    if opts.scroll_to_bottom {
+        let _ = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "window.scrollTo(0, document.body ? document.body.scrollHeight : 0)",
+                    "returnByValue": true
+                }),
+                deadline,
+            )
+            .await?;
+        let remaining = remaining_duration(deadline)?;
+        tokio::time::sleep(remaining.min(Duration::from_millis(200))).await;
     }
 
     if opts.wait_ms > 0 {

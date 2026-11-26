@@ -9,7 +9,7 @@ use sha2::Sha256;
 
 use crate::config::{expand_env_vars_checked, NotifierConfig};
 use crate::error::{Error, Result};
-use crate::numeric::NumericDelta;
+use crate::numeric::{compute_delta, NumericDelta};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -83,6 +83,38 @@ pub async fn send_notifications(
     }
 
     results
+}
+
+/// Sends a synthetic test alert event to a single named notifier.
+pub async fn test_notifier(
+    notifiers: &BTreeMap<String, NotifierConfig>,
+    name: &str,
+) -> NotificationResult {
+    let event = AlertEvent {
+        event: "watch.test".to_string(),
+        watch_id: "test".to_string(),
+        watch_name: "Test Notification".to_string(),
+        url: "https://example.com".to_string(),
+        checked_at: Utc::now(),
+        previous_value: "$100.00".to_string(),
+        current_value: "$85.00".to_string(),
+        numeric_delta: Some(compute_delta(100.0, 85.0)),
+        diff_summary: "+1 / -1 lines".to_string(),
+        diff: "--- previous\n+++ current\n@@ -1 +1 @@\n-$100.00\n+$85.00\n".to_string(),
+        matched_rules: vec!["manual test notification".to_string()],
+    };
+    let targets = vec![name.to_string()];
+    send_notifications(notifiers, &targets, &event)
+        .await
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| NotificationResult {
+            notifier: name.to_string(),
+            kind: "unknown".to_string(),
+            ok: false,
+            status_code: None,
+            error: Some("no notification result returned".to_string()),
+        })
 }
 
 async fn dispatch_single(

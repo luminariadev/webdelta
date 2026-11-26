@@ -623,6 +623,8 @@ async fn render_via_browser(
         executable_path: None,
         wait_for_selector: browser.wait_for_selector.clone(),
         wait_ms: browser.wait_ms.unwrap_or(0),
+        click_selector: browser.click_selector.clone(),
+        scroll_to_bottom: browser.scroll_to_bottom,
         timeout_secs: timeout_secs.max(10),
         user_agent: Some(user_agent.to_string()),
         headers: headers.clone(),

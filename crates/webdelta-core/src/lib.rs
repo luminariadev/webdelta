@@ -2,6 +2,7 @@ pub mod config;
 pub mod diff;
 pub mod engine;
 pub mod error;
+pub mod export;
 pub mod extract;
 pub mod fetch;
 pub mod notify;
@@ -10,16 +11,17 @@ pub mod rules;
 pub mod store;
 
 pub use config::{
-    expand_env_vars, expand_env_vars_checked, load_config, parse_duration, save_config,
-    starter_config_toml, validate, validate_watch_id, BrowserConfig, ConditionConfig, Config,
-    DefaultsConfig, ExtractorConfig, FetchEngine, HttpMethod, NormalizeConfig, NotifierConfig,
-    WatchConfig,
+    expand_env_vars, expand_env_vars_checked, load_config, parse_duration, redact_config_toml,
+    save_config, starter_config_toml, validate, validate_watch_id, BrowserConfig, ConditionConfig,
+    Config, DefaultsConfig, ExtractorConfig, FetchEngine, HttpMethod, NormalizeConfig,
+    NotifierConfig, WatchConfig,
 };
 pub use diff::{compute_diff, DiffResult};
 pub use engine::{sha256_hex, CheckOutcome, CheckStatus, MonitorEngine, PreviewResult};
 pub use error::{Error, Result};
+pub use export::{export_history, ExportFormat};
 pub use extract::extract_content;
-pub use notify::{AlertEvent, NotificationResult};
+pub use notify::{test_notifier, AlertEvent, NotificationResult};
 pub use numeric::{compute_delta, parse_numeric, NumericDelta};
 pub use rules::{evaluate_conditions, RuleEvaluation};
 pub use store::{SnapshotRecord, StateStore};
