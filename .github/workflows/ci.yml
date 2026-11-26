@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bad_dotfiles=$(git ls-files | grep -E '^\.[^g]' || true)
+          bad_dotfiles=$(git ls-files | grep -E '^\.' | grep -Ev '^(\.github/|\.gitignore$|\.dockerignore$)' || true)
           if [ -n "$bad_dotfiles" ]; then
             echo "Unexpected hidden files tracked:"
             echo "$bad_dotfiles"
