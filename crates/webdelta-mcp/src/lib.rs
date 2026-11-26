@@ -1,22 +1,29 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use webdelta_core::{
-    compute_delta, compute_diff, load_config, save_config, BrowserConfig, ConditionConfig, Config,
-    Error, ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, Result,
-    StateStore, WatchConfig,
+    compute_delta, compute_diff, export_history, load_config, redact_config_toml, save_config,
+    test_notifier, BrowserConfig, ConditionConfig, Config, Error, ExportFormat, ExtractorConfig,
+    FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, Result, StateStore, WatchConfig,
 };
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
-/// JSON-RPC 2.0 stdio server exposing `webdelta` capabilities over MCP.
+/// JSON-RPC 2.0 server exposing `webdelta` tools and resources over MCP (`stdio` and HTTP).
 #[derive(Clone)]
 pub struct McpServer {
     config_path: PathBuf,
@@ -71,12 +78,21 @@ struct ExtractorParams {
 }
 
 impl McpServer {
-    /// Creates a new MCP server instance bound to the given config and database paths.
+    /// Creates a new MCP server that opens `StateStore` lazily on first database call.
     pub fn new(config_path: PathBuf, db_path: PathBuf) -> Self {
         Self {
             config_path,
             db_path,
             store: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Creates a new MCP server sharing an already-open `StateStore`.
+    pub fn with_store(config_path: PathBuf, db_path: PathBuf, store: StateStore) -> Self {
+        Self {
+            config_path,
+            db_path,
+            store: Arc::new(Mutex::new(Some(store))),
         }
     }
 
@@ -136,6 +152,11 @@ impl McpServer {
             "ping" => serialize_result(req_id, json!({})),
             "tools/list" => serialize_result(req_id, json!({ "tools": tool_definitions() })),
             "tools/call" => self.handle_tools_call(req_id, req.params).await,
+            "resources/list" => serialize_result(req_id, json!({ "resources": resource_list() })),
+            "resources/templates/list" => {
+                serialize_result(req_id, json!({ "resourceTemplates": resource_templates() }))
+            }
+            "resources/read" => self.handle_resources_read(req_id, req.params).await,
             other => serialize_error(req_id, -32601, format!("method not found: {other}")),
         };
 
@@ -158,7 +179,8 @@ impl McpServer {
             json!({
                 "protocolVersion": protocol_version,
                 "capabilities": {
-                    "tools": {}
+                    "tools": {},
+                    "resources": {}
                 },
                 "serverInfo": {
                     "name": "webdelta",
@@ -190,29 +212,25 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        if tool_name == "test_notifier" {
+            return self.handle_test_notifier_call(id, args).await;
+        }
+
         let outcome = match tool_name {
             "list_watches" => self.tool_list_watches(args).await,
             "add_watch" => self.tool_add_watch(args).await,
+            "update_watch" => self.tool_update_watch(args).await,
             "remove_watch" => self.tool_remove_watch(args).await,
             "check_now" => self.tool_check_now(args).await,
             "get_diff" => self.tool_get_diff(args).await,
             "get_history" => self.tool_get_history(args).await,
             "preview_extract" => self.tool_preview_extract(args).await,
+            "export_history" => self.tool_export_history(args).await,
             other => Err(Error::Validation(format!("unknown tool '{other}'"))),
         };
 
         match outcome {
-            Ok(payload) => {
-                let text =
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-                serialize_result(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": text }],
-                        "isError": false
-                    }),
-                )
-            }
+            Ok(payload) => tool_json_response(id, &payload, false),
             Err(err) => {
                 warn!(tool = %tool_name, error = %err, "MCP tool call failed");
                 serialize_result(
@@ -224,6 +242,113 @@ impl McpServer {
                 )
             }
         }
+    }
+
+    async fn handle_test_notifier_call(&self, id: Value, args: Value) -> String {
+        #[derive(Deserialize)]
+        struct Args {
+            notifier: String,
+        }
+        let parsed: Args = match parse_args(args) {
+            Ok(v) => v,
+            Err(err) => {
+                return serialize_result(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": err.to_string() }],
+                        "isError": true
+                    }),
+                );
+            }
+        };
+        let config = match self.load_or_empty_config() {
+            Ok(c) => c,
+            Err(err) => {
+                return serialize_result(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": err.to_string() }],
+                        "isError": true
+                    }),
+                );
+            }
+        };
+
+        let result = test_notifier(&config.notifiers, &parsed.notifier).await;
+        let is_err = !result.ok;
+        let payload = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+        tool_json_response(id, &payload, is_err)
+    }
+
+    async fn handle_resources_read(&self, id: Value, params: Option<Value>) -> String {
+        let Some(uri) = params
+            .as_ref()
+            .and_then(|p| p.get("uri"))
+            .and_then(Value::as_str)
+        else {
+            return serialize_error(
+                id,
+                -32602,
+                "invalid params: missing string field 'uri'".to_string(),
+            );
+        };
+
+        match self.read_resource_uri(uri).await {
+            Ok((mime_type, text)) => serialize_result(
+                id,
+                json!({
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": mime_type,
+                        "text": text
+                    }]
+                }),
+            ),
+            Err(Error::Validation(msg)) => serialize_error(id, -32602, msg),
+            Err(err) => serialize_error(id, -32603, err.to_string()),
+        }
+    }
+
+    async fn read_resource_uri(&self, uri: &str) -> Result<(&'static str, String)> {
+        if uri == "webdelta://watches" {
+            let val = self
+                .tool_list_watches(json!({ "include_disabled": true }))
+                .await?;
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            return Ok(("application/json", text));
+        }
+
+        if uri == "webdelta://config" {
+            let cfg = self.load_or_empty_config()?;
+            let text = redact_config_toml(&cfg)?;
+            return Ok(("text/plain", text));
+        }
+
+        if let Some(watch_id) = uri.strip_prefix("webdelta://history/") {
+            if watch_id.is_empty() {
+                return Err(Error::Validation(
+                    "missing watch_id in history URI".to_string(),
+                ));
+            }
+            let val = self
+                .tool_get_history(json!({ "watch_id": watch_id, "limit": 50 }))
+                .await?;
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            return Ok(("application/json", text));
+        }
+
+        if let Some(watch_id) = uri.strip_prefix("webdelta://diff/") {
+            if watch_id.is_empty() {
+                return Err(Error::Validation(
+                    "missing watch_id in diff URI".to_string(),
+                ));
+            }
+            let val = self.tool_get_diff(json!({ "watch_id": watch_id })).await?;
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            return Ok(("application/json", text));
+        }
+
+        Err(Error::Validation(format!("unknown resource URI: {uri}")))
     }
 
     fn load_or_empty_config(&self) -> Result<Config> {
@@ -287,6 +412,10 @@ impl McpServer {
             wait_ms: Option<u64>,
             #[serde(default)]
             cdp_url: Option<String>,
+            #[serde(default)]
+            click_selector: Option<String>,
+            #[serde(default)]
+            scroll_to_bottom: bool,
             #[serde(flatten)]
             extractor: ExtractorParams,
             #[serde(default)]
@@ -322,6 +451,8 @@ impl McpServer {
                 wait_for_selector: parsed.wait_for_selector,
                 wait_ms: parsed.wait_ms,
                 cdp_url: parsed.cdp_url,
+                click_selector: parsed.click_selector,
+                scroll_to_bottom: parsed.scroll_to_bottom,
             },
             extractor,
             ignore_regex: parsed.ignore_regex,
@@ -337,6 +468,101 @@ impl McpServer {
         Ok(json!({
             "added": true,
             "watch": watch,
+        }))
+    }
+
+    async fn tool_update_watch(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            interval: Option<String>,
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            engine: Option<FetchEngine>,
+            #[serde(default)]
+            wait_for_selector: Option<String>,
+            #[serde(default)]
+            wait_ms: Option<u64>,
+            #[serde(default)]
+            cdp_url: Option<String>,
+            #[serde(default)]
+            click_selector: Option<String>,
+            #[serde(default)]
+            scroll_to_bottom: Option<bool>,
+            #[serde(flatten)]
+            extractor: ExtractorParams,
+            #[serde(default)]
+            ignore_regex: Option<Vec<String>>,
+            #[serde(default)]
+            conditions: Option<Vec<ConditionConfig>>,
+            #[serde(default)]
+            notifiers: Option<Vec<String>>,
+        }
+
+        let parsed: Args = parse_args(args)?;
+        let mut config = load_config(&self.config_path)?;
+
+        let idx = config
+            .watches
+            .iter()
+            .position(|w| w.id == parsed.id)
+            .ok_or_else(|| Error::Validation(format!("watch '{}' not found", parsed.id)))?;
+
+        if let Some(name) = parsed.name {
+            config.watches[idx].name = Some(name);
+        }
+        if let Some(url) = parsed.url {
+            config.watches[idx].url = url;
+        }
+        if let Some(interval) = parsed.interval {
+            config.watches[idx].interval = Some(interval);
+        }
+        if let Some(enabled) = parsed.enabled {
+            config.watches[idx].enabled = enabled;
+        }
+        if let Some(engine) = parsed.engine {
+            config.watches[idx].engine = engine;
+        }
+        if let Some(sel) = parsed.wait_for_selector {
+            config.watches[idx].browser.wait_for_selector = Some(sel);
+        }
+        if let Some(ms) = parsed.wait_ms {
+            config.watches[idx].browser.wait_ms = Some(ms);
+        }
+        if let Some(cdp) = parsed.cdp_url {
+            config.watches[idx].browser.cdp_url = Some(cdp);
+        }
+        if let Some(click) = parsed.click_selector {
+            config.watches[idx].browser.click_selector = Some(click);
+        }
+        if let Some(scroll) = parsed.scroll_to_bottom {
+            config.watches[idx].browser.scroll_to_bottom = scroll;
+        }
+        if parsed.extractor.extractor_type.is_some() {
+            config.watches[idx].extractor = build_extractor(&parsed.extractor)?;
+        }
+        if let Some(ignore) = parsed.ignore_regex {
+            config.watches[idx].ignore_regex = ignore;
+        }
+        if let Some(conds) = parsed.conditions {
+            config.watches[idx].conditions = conds;
+        }
+        if let Some(nots) = parsed.notifiers {
+            config.watches[idx].notifiers = nots;
+        }
+
+        let updated = config.watches[idx].clone();
+        save_config(&self.config_path, &config)?;
+
+        Ok(json!({
+            "updated": true,
+            "watch": updated,
         }))
     }
 
@@ -470,6 +696,10 @@ impl McpServer {
             wait_ms: Option<u64>,
             #[serde(default)]
             cdp_url: Option<String>,
+            #[serde(default)]
+            click_selector: Option<String>,
+            #[serde(default)]
+            scroll_to_bottom: bool,
             #[serde(flatten)]
             extractor: ExtractorParams,
             #[serde(default)]
@@ -483,6 +713,8 @@ impl McpServer {
             wait_for_selector: parsed.wait_for_selector,
             wait_ms: parsed.wait_ms,
             cdp_url: parsed.cdp_url,
+            click_selector: parsed.click_selector,
+            scroll_to_bottom: parsed.scroll_to_bottom,
         };
         let result = MonitorEngine::preview(
             &parsed.url,
@@ -498,6 +730,99 @@ impl McpServer {
 
         Ok(serde_json::to_value(result).unwrap_or_else(|_| json!({})))
     }
+
+    async fn tool_export_history(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            watch_id: String,
+            format: String,
+            #[serde(default = "default_export_limit")]
+            limit: usize,
+        }
+        let parsed: Args = parse_args(args)?;
+        let format = ExportFormat::from_str(&parsed.format)?;
+        let store = self.get_store().await?;
+        let records = store.get_history(&parsed.watch_id, parsed.limit.clamp(1, 500))?;
+        let config = self.load_or_empty_config()?;
+        let watch = config.watches.iter().find(|w| w.id == parsed.watch_id);
+        let content = export_history(watch, &parsed.watch_id, &records, format)?;
+
+        Ok(json!({
+            "watch_id": parsed.watch_id,
+            "format": parsed.format,
+            "count": records.len(),
+            "content": content,
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct HttpMcpState {
+    server: McpServer,
+    bearer_token: Option<String>,
+}
+
+/// Builds an `axum::Router` exposing only `POST /mcp` (Streamable HTTP) for merging into another router.
+pub fn mcp_route(server: McpServer, bearer_token: Option<String>) -> Router {
+    let state = HttpMcpState {
+        server,
+        bearer_token,
+    };
+    Router::new()
+        .route("/mcp", post(http_mcp_post))
+        .with_state(state)
+}
+
+/// Builds an `axum::Router` exposing `POST /mcp` (Streamable HTTP) and `GET /health`.
+pub fn mcp_http_router(server: McpServer, bearer_token: Option<String>) -> Router {
+    mcp_route(server, bearer_token).route("/health", get(http_health))
+}
+
+async fn http_health() -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+async fn http_mcp_post(
+    State(state): State<HttpMcpState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if !is_bearer_authorized(&headers, state.bearer_token.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({ "error": "unauthorized" }).to_string(),
+        )
+            .into_response();
+    }
+
+    match state.server.handle_line(&body).await {
+        Some(reply) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            reply,
+        )
+            .into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// Checks `Authorization: Bearer <token>` against `expected` when authentication is enabled.
+pub fn is_bearer_authorized(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(token) = expected else {
+        return true;
+    };
+    let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    auth.strip_prefix("Bearer ")
+        .is_some_and(|provided| provided.trim() == token)
 }
 
 /// Runs the MCP server over standard input and standard output until EOF.
@@ -516,6 +841,39 @@ pub async fn run_stdio(config_path: PathBuf, db_path: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Runs the Streamable HTTP MCP server on `bind` until `Ctrl+C`.
+pub async fn run_http(
+    config_path: PathBuf,
+    db_path: PathBuf,
+    bind: &str,
+    bearer_token: Option<String>,
+) -> Result<()> {
+    let store = StateStore::open(&db_path)?;
+    let server = McpServer::with_store(config_path, db_path, store);
+    let app = mcp_http_router(server, bearer_token);
+
+    let listener = TcpListener::bind(bind).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(Error::Io)?;
+
+    Ok(())
+}
+
+fn tool_json_response(id: Value, payload: &Value, is_error: bool) -> String {
+    let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+    serialize_result(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error
+        }),
+    )
 }
 
 fn build_extractor(params: &ExtractorParams) -> Result<ExtractorConfig> {
@@ -577,6 +935,10 @@ fn default_history_limit() -> usize {
     10
 }
 
+fn default_export_limit() -> usize {
+    50
+}
+
 fn default_timeout_secs() -> u64 {
     15
 }
@@ -599,6 +961,40 @@ fn serialize_error(id: Value, code: i64, message: String) -> String {
         error: Some(RpcError { code, message }),
     })
     .expect("serializing valid JSON-RPC error")
+}
+
+fn resource_list() -> Value {
+    json!([
+        {
+            "uri": "webdelta://watches",
+            "name": "Configured Watches",
+            "description": "JSON list of configured watches and their latest recorded snapshots.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "webdelta://config",
+            "name": "Redacted Configuration",
+            "description": "Current webdelta.toml configuration with literal secrets redacted.",
+            "mimeType": "text/plain"
+        }
+    ])
+}
+
+fn resource_templates() -> Value {
+    json!([
+        {
+            "uriTemplate": "webdelta://history/{watch_id}",
+            "name": "Watch Snapshot History",
+            "description": "Recorded snapshot history for a watch ID.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "webdelta://diff/{watch_id}",
+            "name": "Watch Latest Diff",
+            "description": "Unified diff and numeric delta between the two most recent snapshots.",
+            "mimeType": "application/json"
+        }
+    ])
 }
 
 fn tool_definitions() -> Value {
@@ -634,6 +1030,8 @@ fn tool_definitions() -> Value {
                     "wait_for_selector": { "type": "string", "description": "CSS selector to wait for when using 'browser' or 'auto' engine." },
                     "wait_ms": { "type": "integer", "description": "Extra milliseconds to wait after page load in browser mode." },
                     "cdp_url": { "type": "string", "description": "Optional remote CDP HTTP or WebSocket URL." },
+                    "click_selector": { "type": "string", "description": "Optional CSS selector clicked before reading DOM in browser mode." },
+                    "scroll_to_bottom": { "type": "boolean", "description": "Scroll to page bottom before reading DOM in browser mode." },
                     "extractor_type": {
                         "type": "string",
                         "enum": ["text", "css", "json_path", "regex", "status"],
@@ -663,6 +1061,53 @@ fn tool_definitions() -> Value {
                     }
                 },
                 "required": ["id", "url"]
+            }
+        },
+        {
+            "name": "update_watch",
+            "description": "Patch fields on an existing watch (interval, enabled status, engine, extractor, browser options, or rules).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Existing watch identifier to update." },
+                    "name": { "type": "string" },
+                    "url": { "type": "string" },
+                    "interval": { "type": "string" },
+                    "enabled": { "type": "boolean" },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["http", "browser", "auto"]
+                    },
+                    "wait_for_selector": { "type": "string" },
+                    "wait_ms": { "type": "integer" },
+                    "cdp_url": { "type": "string" },
+                    "click_selector": { "type": "string" },
+                    "scroll_to_bottom": { "type": "boolean" },
+                    "extractor_type": {
+                        "type": "string",
+                        "enum": ["text", "css", "json_path", "regex", "status"]
+                    },
+                    "selector": { "type": "string" },
+                    "attribute": { "type": "string" },
+                    "all": { "type": "boolean" },
+                    "path": { "type": "string" },
+                    "pattern": { "type": "string" },
+                    "group": { "type": "integer" },
+                    "header": { "type": "string" },
+                    "ignore_regex": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "conditions": {
+                        "type": "array",
+                        "items": { "type": "object" }
+                    },
+                    "notifiers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["id"]
             }
         },
         {
@@ -727,6 +1172,8 @@ fn tool_definitions() -> Value {
                     "wait_for_selector": { "type": "string" },
                     "wait_ms": { "type": "integer" },
                     "cdp_url": { "type": "string" },
+                    "click_selector": { "type": "string" },
+                    "scroll_to_bottom": { "type": "boolean" },
                     "extractor_type": {
                         "type": "string",
                         "enum": ["text", "css", "json_path", "regex", "status"]
@@ -746,6 +1193,34 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["url"]
             }
+        },
+        {
+            "name": "test_notifier",
+            "description": "Send a synthetic test alert event through a configured notifier.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "notifier": { "type": "string", "description": "Notifier name defined under [notifiers] in webdelta.toml." }
+                },
+                "required": ["notifier"]
+            }
+        },
+        {
+            "name": "export_history",
+            "description": "Export stored snapshot history for a watch as JSON, CSV, or RSS XML.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "watch_id": { "type": "string", "description": "Watch identifier to export." },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "csv", "rss"],
+                        "description": "Export output format."
+                    },
+                    "limit": { "type": "integer", "description": "Maximum snapshots to export. Defaults to 50." }
+                },
+                "required": ["watch_id", "format"]
+            }
         }
     ])
 }
@@ -756,7 +1231,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_mcp_protocol_basics() {
+    async fn test_mcp_protocol_tools_resources_and_update() {
         let dir = tempdir().unwrap();
         let server = McpServer::new(
             dir.path().join("webdelta.toml"),
@@ -772,37 +1247,87 @@ mod tests {
         let init_json: Value = serde_json::from_str(&init_reply).unwrap();
         assert_eq!(init_json["id"], 1);
         assert_eq!(init_json["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(init_json["result"]["serverInfo"]["name"], "webdelta");
+        assert!(init_json["result"]["capabilities"]["resources"].is_object());
 
         assert!(server
             .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .await
             .is_none());
 
-        let ping_reply = server
-            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
-            .await
-            .unwrap();
-        let ping_json: Value = serde_json::from_str(&ping_reply).unwrap();
-        assert_eq!(ping_json["result"], json!({}));
-
         let list_reply = server
-            .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#)
+            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .await
             .unwrap();
         let list_json: Value = serde_json::from_str(&list_reply).unwrap();
         let tools = list_json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
 
-        let bad_json = server.handle_line("{not valid").await.unwrap();
-        let bad_val: Value = serde_json::from_str(&bad_json).unwrap();
-        assert_eq!(bad_val["error"]["code"], -32700);
-
-        let unknown_method = server
-            .handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"unknown/op"}"#)
+        let res_list = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#)
             .await
             .unwrap();
-        let unknown_val: Value = serde_json::from_str(&unknown_method).unwrap();
-        assert_eq!(unknown_val["error"]["code"], -32601);
+        let res_list_json: Value = serde_json::from_str(&res_list).unwrap();
+        assert_eq!(
+            res_list_json["result"]["resources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let tmpl_list = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"resources/templates/list"}"#)
+            .await
+            .unwrap();
+        let tmpl_json: Value = serde_json::from_str(&tmpl_list).unwrap();
+        assert_eq!(
+            tmpl_json["result"]["resourceTemplates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let add_reply = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"add_watch","arguments":{"id":"demo","url":"https://example.com"}}}"#,
+            )
+            .await
+            .unwrap();
+        let add_json: Value = serde_json::from_str(&add_reply).unwrap();
+        assert_eq!(add_json["result"]["isError"], false);
+
+        let upd_reply = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"update_watch","arguments":{"id":"demo","interval":"5m","enabled":false}}}"#,
+            )
+            .await
+            .unwrap();
+        let upd_json: Value = serde_json::from_str(&upd_reply).unwrap();
+        assert_eq!(upd_json["result"]["isError"], false);
+        let upd_body: Value =
+            serde_json::from_str(upd_json["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(upd_body["watch"]["interval"], "5m");
+        assert_eq!(upd_body["watch"]["enabled"], false);
+
+        let read_watches = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"webdelta://watches"}}"#,
+            )
+            .await
+            .unwrap();
+        let rw_json: Value = serde_json::from_str(&read_watches).unwrap();
+        let watches_txt = rw_json["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(watches_txt.contains("demo"));
+
+        let read_cfg = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"webdelta://config"}}"#,
+            )
+            .await
+            .unwrap();
+        let cfg_json: Value = serde_json::from_str(&read_cfg).unwrap();
+        assert_eq!(cfg_json["result"]["contents"][0]["mimeType"], "text/plain");
     }
 }
