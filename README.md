@@ -20,7 +20,67 @@ Most change trackers either launch a heavy browser stack for every URL check or 
 - **Numeric and price conditions**: parses currency formats (`$1,299.99`, `Rp 1.500.000`, `EUR 49,90`, `-12.5`, `99.95%`) while ignoring semver tags, IP addresses, and dates, triggering alerts on percentage drops, rises, or thresholds.
 - **Automation-ready**: supports `--json` output, script-friendly `--exit-code` (`0` unchanged, `2` changed, `1` error), signed HMAC-SHA256 webhooks for n8n, Telegram, Discord, Slack, ntfy, and a built-in `stdio` + Streamable HTTP MCP server.
 
+## Preview
+
+Embedded web dashboard (`webdelta serve`) tracking HTTP, hybrid `auto`, and paused watches:
+
+![webdelta local web dashboard showing monitored watches](docs/assets/dashboard-overview.png)
+
+| History & Numeric Sparkline | Unified Diff & Delta |
+| :---: | :---: |
+| ![History modal with SVG sparkline and JSON/CSV/RSS export controls](docs/assets/dashboard-history.png) | ![Unified diff modal showing numeric delta and highlighted line changes](docs/assets/dashboard-diff.png) |
+
+Real CLI diff output after consecutive price checks:
+
+```text
+$ webdelta diff workstation-gpu
+Watch: workstation-gpu
+Previous (2026-11-26 16:50:30 UTC): $1,149.00
+Current  (2026-11-26 16:50:32 UTC): $1,049.00
+Numeric delta: -100.00 (-8.70%)
+Summary: +1 / -1 lines
+--- previous
++++ current
+@@ -1 +1 @@
+-$1,149.00
+\ No newline at end of file
++$1,049.00
+\ No newline at end of file
+```
+
 ## Installation
+
+### Prebuilt Binaries
+
+Download an archive for Linux (`x86_64`), Windows (`x86_64`), or macOS (`x86_64` and Apple Silicon) together with `SHA256SUMS.txt` from [GitHub Releases](https://github.com/luminariadev/webdelta/releases).
+
+### Scoop (Windows)
+
+```powershell
+scoop install https://raw.githubusercontent.com/luminariadev/webdelta/main/packaging/scoop/webdelta.json
+```
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install --formula https://raw.githubusercontent.com/luminariadev/webdelta/main/packaging/homebrew/webdelta.rb
+```
+
+### Docker / GHCR
+
+Pull the published public container image or run with Docker Compose:
+
+```bash
+docker pull ghcr.io/luminariadev/webdelta:latest
+```
+
+Or run the dashboard, background polling scheduler, and HTTP `/mcp` endpoint via Compose:
+
+```bash
+mkdir -p data
+cp examples/price-tracker.toml data/webdelta.toml
+docker compose up -d --build
+```
 
 ### Build from Source
 
@@ -32,17 +92,7 @@ cd webdelta
 cargo install --path crates/webdelta-cli
 ```
 
-### Docker
-
-Run the embedded dashboard, background polling scheduler, and HTTP MCP endpoint with Docker Compose:
-
-```bash
-mkdir -p data
-cp examples/price-tracker.toml data/webdelta.toml
-docker compose up -d --build
-```
-
-See [docs/docker.md](docs/docker.md) for container environment variables and GHCR images. Prebuilt release archives for Linux, Windows, and macOS are also published with SHA-256 checksums on [Releases](https://github.com/luminariadev/webdelta/releases).
+See [docs/distribution.md](docs/distribution.md) for checksum verification, package manifests, and [docs/docker.md](docs/docker.md) for container configuration.
 
 ## Quickstart
 
