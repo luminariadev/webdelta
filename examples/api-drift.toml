@@ -1,0 +1,46 @@
+# Detect JSON API schema or version drift and endpoint HTTP status changes.
+
+[defaults]
+interval = "5m"
+timeout_secs = 10
+retries = 3
+max_history = 500
+concurrency = 12
+
+[notifiers.ops_ntfy]
+type = "ntfy"
+url = "https://ntfy.sh"
+topic = "webdelta-api-alerts"
+priority = "high"
+tags = ["warning", "api"]
+
+[notifiers.ops_slack]
+type = "slack"
+webhook_url = "${SLACK_WEBHOOK_URL}"
+
+[[watches]]
+id = "catalog-api-version"
+name = "Catalog API Version"
+url = "https://api.example.com/v1/meta"
+notifiers = ["ops_ntfy", "ops_slack"]
+
+[watches.extractor]
+type = "json_path"
+path = "$.version"
+
+[[watches.conditions]]
+type = "changed"
+
+[[watches]]
+id = "checkout-health"
+name = "Checkout Health Status"
+url = "https://api.example.com/health"
+interval = "1m"
+notifiers = ["ops_ntfy"]
+
+[watches.extractor]
+type = "status"
+header = "x-release-sha"
+
+[[watches.conditions]]
+type = "changed"

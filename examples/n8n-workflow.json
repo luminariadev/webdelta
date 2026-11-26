@@ -1,0 +1,76 @@
+{
+  "name": "webdelta Price & Change Alert Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webdelta-alerts",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "webdelta Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.body.numeric_delta ? $json.body.numeric_delta.percent_change : 0 }}",
+              "operation": "smallerEqual",
+              "value2": -10
+            }
+          ]
+        }
+      },
+      "id": "drop-check",
+      "name": "Price Drop >= 10%",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ 'Alert: ' + $json.body.watch_name + '\\nPrevious: ' + $json.body.previous_value + '\\nCurrent: ' + $json.body.current_value + '\\nURL: ' + $json.body.url }}"
+      },
+      "id": "send-telegram",
+      "name": "Notify Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [760, 220]
+    }
+  ],
+  "connections": {
+    "webdelta Webhook": {
+      "main": [
+        [
+          {
+            "node": "Price Drop >= 10%",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Price Drop >= 10%": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

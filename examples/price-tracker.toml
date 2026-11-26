@@ -1,0 +1,50 @@
+# Track product pricing and stock availability with noise filtering and n8n webhook alerts.
+
+[defaults]
+interval = "30m"
+timeout_secs = 15
+retries = 2
+max_history = 200
+concurrency = 8
+
+[notifiers.n8n]
+type = "webhook"
+url = "https://n8n.example.com/webhook/webdelta-alerts"
+secret = "${WEBDELTA_WEBHOOK_SECRET}"
+
+[notifiers.telegram]
+type = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "${TELEGRAM_CHAT_ID}"
+
+[[watches]]
+id = "laptop-price"
+name = "Workstation Laptop Price"
+url = "https://shop.example.com/products/workstation-pro"
+interval = "15m"
+notifiers = ["n8n", "telegram"]
+
+[watches.extractor]
+type = "css"
+selector = ".product-summary .price"
+
+[[watches.conditions]]
+type = "drop_pct_at_least"
+percent = 10.0
+
+[[watches]]
+id = "gpu-stock"
+name = "GPU Stock Status"
+url = "https://shop.example.com/products/gpu-5090"
+interval = "10m"
+ignore_regex = ["Updated:\\s+\\d{2}:\\d{2}:\\d{2}"]
+notifiers = ["telegram"]
+
+[watches.extractor]
+type = "css"
+selector = ".availability-badge"
+
+[[watches.conditions]]
+type = "contains"
+value = "In Stock"
+case_sensitive = false
