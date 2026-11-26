@@ -76,6 +76,38 @@ impl HttpMethod {
     }
 }
 
+/// Engine mode used to fetch and render a watch target.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchEngine {
+    #[default]
+    Http,
+    Browser,
+    Auto,
+}
+
+impl FetchEngine {
+    /// Returns the lowercase name of the fetch engine.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Browser => "browser",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Optional browser rendering settings used when `engine` is `browser` or `auto`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserConfig {
+    #[serde(default)]
+    pub wait_for_selector: Option<String>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub cdp_url: Option<String>,
+}
+
 /// Configuration for a single monitored URL or API endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WatchConfig {
@@ -93,6 +125,10 @@ pub struct WatchConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub retries: Option<usize>,
+    #[serde(default)]
+    pub engine: FetchEngine,
+    #[serde(default)]
+    pub browser: BrowserConfig,
     #[serde(default)]
     pub extractor: ExtractorConfig,
     #[serde(default)]
@@ -447,6 +483,7 @@ pub fn validate(config: &Config) -> Result<()> {
         }
 
         validate_extractor(&watch.id, &watch.extractor)?;
+        validate_browser_config(&watch.id, &watch.browser)?;
 
         for pattern in &watch.ignore_regex {
             Regex::new(pattern).map_err(|err| {
@@ -569,6 +606,35 @@ fn validate_extractor(watch_id: &str, extractor: &ExtractorConfig) -> Result<()>
     }
 }
 
+fn validate_browser_config(watch_id: &str, browser: &BrowserConfig) -> Result<()> {
+    if let Some(selector) = &browser.wait_for_selector {
+        Selector::parse(selector).map_err(|err| {
+            Error::Validation(format!(
+                "watch '{watch_id}' has invalid browser.wait_for_selector '{selector}': {err:?}"
+            ))
+        })?;
+    }
+    if let Some(cdp_url) = &browser.cdp_url {
+        let trimmed = cdp_url.trim();
+        if !trimmed.contains("${") {
+            let parsed = Url::parse(trimmed).map_err(|err| {
+                Error::Validation(format!(
+                    "watch '{watch_id}' has invalid browser.cdp_url '{cdp_url}': {err}"
+                ))
+            })?;
+            match parsed.scheme() {
+                "http" | "https" | "ws" | "wss" => {}
+                other => {
+                    return Err(Error::Validation(format!(
+                        "watch '{watch_id}' browser.cdp_url has unsupported scheme '{other}': expected http, https, ws, or wss"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_condition(watch_id: &str, condition: &ConditionConfig) -> Result<()> {
     match condition {
         ConditionConfig::Changed
@@ -686,6 +752,8 @@ mod tests {
             interval: None,
             timeout_secs: None,
             retries: None,
+            engine: FetchEngine::Http,
+            browser: BrowserConfig::default(),
             extractor: ExtractorConfig::Text,
             ignore_regex: vec![],
             normalize: NormalizeConfig::default(),

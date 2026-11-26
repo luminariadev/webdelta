@@ -7,8 +7,9 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use webdelta_core::{
-    CheckStatus, ConditionConfig, Config, DefaultsConfig, ExtractorConfig, HttpMethod,
-    MonitorEngine, NormalizeConfig, NotifierConfig, StateStore, WatchConfig,
+    discover_browser_binary, BrowserConfig, CheckStatus, ConditionConfig, Config, DefaultsConfig,
+    ExtractorConfig, FetchEngine, HttpMethod, MonitorEngine, NormalizeConfig, NotifierConfig,
+    StateStore, WatchConfig,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -162,6 +163,8 @@ async fn test_end_to_end_check_etag_diff_drop_pct_and_hmac_webhook() {
         interval: Some("5m".to_string()),
         timeout_secs: Some(5),
         retries: Some(1),
+        engine: FetchEngine::Http,
+        browser: BrowserConfig::default(),
         extractor: ExtractorConfig::Css {
             selector: ".price, .ts".to_string(),
             attribute: None,
@@ -263,6 +266,8 @@ async fn test_telegram_notifier_and_rule_not_met_suppression() {
         interval: None,
         timeout_secs: Some(5),
         retries: Some(0),
+        engine: FetchEngine::Http,
+        browser: BrowserConfig::default(),
         extractor: ExtractorConfig::Css {
             selector: "p".to_string(),
             attribute: None,
@@ -336,6 +341,8 @@ async fn test_retry_recovery_after_transient_500() {
         interval: None,
         timeout_secs: Some(5),
         retries: Some(2),
+        engine: FetchEngine::Http,
+        browser: BrowserConfig::default(),
         extractor: ExtractorConfig::Css {
             selector: "div".to_string(),
             attribute: None,
@@ -359,4 +366,87 @@ async fn test_retry_recovery_after_transient_500() {
     assert_eq!(res.status_code, Some(200));
     assert_eq!(res.current_value.as_deref(), Some("Healthy"));
     assert_eq!(state.lock().unwrap().requests_seen, 3);
+}
+
+#[tokio::test]
+async fn test_spa_page_rendered_via_browser_and_auto_engines() {
+    let spa_html = r#"<!doctype html>
+<html>
+  <head><title>SPA Shop</title></head>
+  <body>
+    <div id="root"></div>
+    <script>
+      setTimeout(function () {
+        document.getElementById('root').innerHTML = '<span class="price">$249.00</span>';
+      }, 40);
+    </script>
+  </body>
+</html>"#;
+
+    let state = Arc::new(Mutex::new(MockState {
+        html_body: spa_html.to_string(),
+        etag: "\"spa1\"".to_string(),
+        ..Default::default()
+    }));
+    let base_url = start_mock_server(Arc::clone(&state)).await;
+
+    let dir = tempdir().unwrap();
+    let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+    let engine = MonitorEngine::new(store).unwrap();
+
+    let mut base_watch = WatchConfig {
+        id: "spa-http".to_string(),
+        name: None,
+        url: format!("{base_url}/spa"),
+        method: HttpMethod::Get,
+        headers: BTreeMap::new(),
+        interval: None,
+        timeout_secs: Some(20),
+        retries: Some(0),
+        engine: FetchEngine::Http,
+        browser: BrowserConfig {
+            wait_for_selector: Some(".price".to_string()),
+            wait_ms: None,
+            cdp_url: None,
+        },
+        extractor: ExtractorConfig::Css {
+            selector: ".price".to_string(),
+            attribute: None,
+            all: false,
+        },
+        ignore_regex: vec![],
+        normalize: NormalizeConfig::default(),
+        conditions: vec![],
+        notifiers: vec![],
+        enabled: true,
+    };
+
+    let config = Config {
+        defaults: DefaultsConfig::default(),
+        notifiers: BTreeMap::new(),
+        watches: vec![],
+    };
+
+    // Plain HTTP cannot see JS-injected DOM nodes.
+    let http_res = engine.check_watch(&base_watch, &config, false).await;
+    assert_eq!(http_res.status, CheckStatus::Error);
+    assert_eq!(http_res.engine_used, "http");
+
+    if discover_browser_binary().is_some() {
+        base_watch.id = "spa-browser".to_string();
+        base_watch.engine = FetchEngine::Browser;
+        let browser_res = engine.check_watch(&base_watch, &config, false).await;
+        assert_eq!(browser_res.status, CheckStatus::Initial, "{browser_res:?}");
+        assert_eq!(browser_res.engine_used, "browser");
+        assert_eq!(browser_res.current_value.as_deref(), Some("$249.00"));
+        assert_eq!(browser_res.numeric_value, Some(249.0));
+
+        base_watch.id = "spa-auto".to_string();
+        base_watch.engine = FetchEngine::Auto;
+        let auto_res = engine.check_watch(&base_watch, &config, false).await;
+        assert_eq!(auto_res.status, CheckStatus::Initial, "{auto_res:?}");
+        assert_eq!(auto_res.engine_used, "browser");
+        assert_eq!(auto_res.current_value.as_deref(), Some("$249.00"));
+        assert_eq!(auto_res.numeric_value, Some(249.0));
+    }
 }

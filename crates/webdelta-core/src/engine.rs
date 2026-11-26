@@ -6,8 +6,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tracing::debug;
+use webdelta_browser::{looks_like_spa_shell, render_page, BrowserOptions};
 
-use crate::config::{Config, ExtractorConfig, HttpMethod, NormalizeConfig, WatchConfig};
+use crate::config::{
+    expand_env_vars, BrowserConfig, Config, ExtractorConfig, FetchEngine, HttpMethod,
+    NormalizeConfig, WatchConfig,
+};
 use crate::diff::{compute_diff, DiffResult};
 use crate::error::{Error, Result};
 use crate::extract::extract_content;
@@ -49,6 +54,7 @@ pub struct CheckOutcome {
     pub watch_id: String,
     pub watch_name: String,
     pub url: String,
+    pub engine_used: String,
     pub status: CheckStatus,
     pub status_code: Option<u16>,
     pub elapsed_ms: u64,
@@ -66,6 +72,7 @@ pub struct CheckOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreviewResult {
     pub url: String,
+    pub engine_used: String,
     pub status_code: u16,
     pub elapsed_ms: u64,
     pub extracted_text: String,
@@ -73,7 +80,21 @@ pub struct PreviewResult {
     pub content_hash: String,
 }
 
-/// Coordinates HTTP fetching, extraction, diffing, state storage, and notifications.
+enum FetchExtractOutcome {
+    NotModified {
+        elapsed_ms: u64,
+    },
+    Extracted {
+        status_code: u16,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        extracted_text: String,
+        elapsed_ms: u64,
+        engine_used: &'static str,
+    },
+}
+
+/// Coordinates HTTP/browser fetching, extraction, diffing, state storage, and notifications.
 #[derive(Debug, Clone)]
 pub struct MonitorEngine {
     fetcher: HttpFetcher,
@@ -95,58 +116,59 @@ impl MonitorEngine {
     }
 
     /// Fetches a URL once and previews extraction and numeric parsing without saving state.
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview(
         url: &str,
         extractor: &ExtractorConfig,
         ignore_regex: &[String],
         normalize: &NormalizeConfig,
         timeout_secs: u64,
+        engine: FetchEngine,
+        browser: &BrowserConfig,
+        headers: &BTreeMap<String, String>,
     ) -> Result<PreviewResult> {
         let fetcher = HttpFetcher::new()?;
-        let empty_headers = BTreeMap::new();
         let ua = format!("webdelta/{}", env!("CARGO_PKG_VERSION"));
-        let output = fetcher
-            .fetch(FetchRequest {
-                url,
-                method: HttpMethod::Get,
-                headers: &empty_headers,
-                user_agent: &ua,
-                timeout: Duration::from_secs(timeout_secs.max(1)),
-                retries: 1,
-                etag: None,
-                last_modified: None,
-            })
-            .await?;
-
-        let FetchOutput::Response {
-            status,
+        let res = fetch_and_extract(
+            &fetcher,
+            url,
+            HttpMethod::Get,
             headers,
-            body,
+            &ua,
+            timeout_secs.max(1),
+            1,
+            None,
+            None,
+            extractor,
+            ignore_regex,
+            normalize,
+            engine,
+            browser,
+        )
+        .await?;
+
+        let FetchExtractOutcome::Extracted {
+            status_code,
+            extracted_text,
             elapsed_ms,
+            engine_used,
             ..
-        } = output
+        } = res
         else {
             return Err(Error::Http(
                 "unexpected 304 response during preview".to_string(),
             ));
         };
 
-        if status >= 400 && !matches!(extractor, ExtractorConfig::Status { .. }) {
-            return Err(Error::Http(format!(
-                "preview target '{url}' returned HTTP {status}"
-            )));
-        }
-
-        let extracted =
-            extract_content(&body, status, &headers, extractor, ignore_regex, normalize)?;
-        let numeric_value = parse_numeric(&extracted);
-        let content_hash = sha256_hex(&extracted);
+        let numeric_value = parse_numeric(&extracted_text);
+        let content_hash = sha256_hex(&extracted_text);
 
         Ok(PreviewResult {
             url: url.to_string(),
-            status_code: status,
+            engine_used: engine_used.to_string(),
+            status_code,
             elapsed_ms,
-            extracted_text: extracted,
+            extracted_text,
             numeric_value,
             content_hash,
         })
@@ -161,37 +183,45 @@ impl MonitorEngine {
     ) -> CheckOutcome {
         let previous = match self.store.get_latest(&watch.id) {
             Ok(prev) => prev,
-            Err(err) => return error_outcome(watch, None, 0, err.to_string()),
+            Err(err) => {
+                return error_outcome(watch, watch.engine.as_str(), None, 0, err.to_string())
+            }
         };
 
-        let fetch_res = self
-            .fetcher
-            .fetch(FetchRequest {
-                url: &watch.url,
-                method: watch.method,
-                headers: &watch.headers,
-                user_agent: &config.defaults.user_agent,
-                timeout: Duration::from_secs(watch.effective_timeout_secs(&config.defaults)),
-                retries: watch.effective_retries(&config.defaults),
-                etag: previous.as_ref().and_then(|p| p.etag.as_deref()),
-                last_modified: previous.as_ref().and_then(|p| p.last_modified.as_deref()),
-            })
-            .await;
+        let outcome = fetch_and_extract(
+            &self.fetcher,
+            &watch.url,
+            watch.method,
+            &watch.headers,
+            &config.defaults.user_agent,
+            watch.effective_timeout_secs(&config.defaults),
+            watch.effective_retries(&config.defaults),
+            previous.as_ref().and_then(|p| p.etag.as_deref()),
+            previous.as_ref().and_then(|p| p.last_modified.as_deref()),
+            &watch.extractor,
+            &watch.ignore_regex,
+            &watch.normalize,
+            watch.engine,
+            &watch.browser,
+        )
+        .await;
 
-        let output = match fetch_res {
-            Ok(out) => out,
-            Err(err) => return error_outcome(watch, None, 0, err.to_string()),
+        let extracted_res = match outcome {
+            Ok(res) => res,
+            Err(err) => {
+                return error_outcome(watch, watch.engine.as_str(), None, 0, err.to_string())
+            }
         };
 
         let checked_at = Utc::now();
 
-        match output {
-            FetchOutput::NotModified { elapsed_ms } => {
+        match extracted_res {
+            FetchExtractOutcome::NotModified { elapsed_ms } => {
                 if let Err(err) = self
                     .store
                     .update_latest_metadata(&watch.id, checked_at, 304, elapsed_ms, None, None)
                 {
-                    return error_outcome(watch, Some(304), elapsed_ms, err.to_string());
+                    return error_outcome(watch, "http", Some(304), elapsed_ms, err.to_string());
                 }
                 let prev_text = previous.as_ref().map(|p| p.extracted_text.clone());
                 let prev_num = previous.as_ref().and_then(|p| p.numeric_value);
@@ -199,6 +229,7 @@ impl MonitorEngine {
                     watch_id: watch.id.clone(),
                     watch_name: watch.display_name().to_string(),
                     url: watch.url.clone(),
+                    engine_used: "http".to_string(),
                     status: CheckStatus::NotModified,
                     status_code: Some(304),
                     elapsed_ms,
@@ -212,48 +243,25 @@ impl MonitorEngine {
                     error: None,
                 }
             }
-            FetchOutput::Response {
-                status,
-                headers,
-                body,
+            FetchExtractOutcome::Extracted {
+                status_code,
                 etag,
                 last_modified,
+                extracted_text,
                 elapsed_ms,
+                engine_used,
             } => {
-                if status >= 400 && !matches!(watch.extractor, ExtractorConfig::Status { .. }) {
-                    return error_outcome(
-                        watch,
-                        Some(status),
-                        elapsed_ms,
-                        format!("HTTP {status} returned from '{}'", watch.url),
-                    );
-                }
-
-                let extracted = match extract_content(
-                    &body,
-                    status,
-                    &headers,
-                    &watch.extractor,
-                    &watch.ignore_regex,
-                    &watch.normalize,
-                ) {
-                    Ok(text) => text,
-                    Err(err) => {
-                        return error_outcome(watch, Some(status), elapsed_ms, err.to_string())
-                    }
-                };
-
-                let numeric_value = parse_numeric(&extracted);
-                let content_hash = sha256_hex(&extracted);
+                let numeric_value = parse_numeric(&extracted_text);
+                let content_hash = sha256_hex(&extracted_text);
 
                 let record = SnapshotRecord {
                     watch_id: watch.id.clone(),
                     checked_at,
-                    status_code: status,
+                    status_code,
                     etag,
                     last_modified,
                     content_hash,
-                    extracted_text: extracted.clone(),
+                    extracted_text: extracted_text.clone(),
                     numeric_value,
                     elapsed_ms,
                 };
@@ -264,17 +272,24 @@ impl MonitorEngine {
                             .store
                             .record_snapshot(&record, config.defaults.max_history)
                         {
-                            return error_outcome(watch, Some(status), elapsed_ms, err.to_string());
+                            return error_outcome(
+                                watch,
+                                engine_used,
+                                Some(status_code),
+                                elapsed_ms,
+                                err.to_string(),
+                            );
                         }
                         CheckOutcome {
                             watch_id: watch.id.clone(),
                             watch_name: watch.display_name().to_string(),
                             url: watch.url.clone(),
+                            engine_used: engine_used.to_string(),
                             status: CheckStatus::Initial,
-                            status_code: Some(status),
+                            status_code: Some(status_code),
                             elapsed_ms,
                             previous_value: None,
-                            current_value: Some(extracted),
+                            current_value: Some(extracted_text),
                             numeric_value,
                             numeric_delta: None,
                             diff: None,
@@ -283,27 +298,33 @@ impl MonitorEngine {
                             error: None,
                         }
                     }
-                    Some(prev) if prev.extracted_text == extracted => {
-                        // Update `latest` metadata without appending duplicate history.
+                    Some(prev) if prev.extracted_text == extracted_text => {
                         if let Err(err) = self.store.update_latest_metadata(
                             &watch.id,
                             checked_at,
-                            status,
+                            status_code,
                             elapsed_ms,
                             record.etag.clone(),
                             record.last_modified.clone(),
                         ) {
-                            return error_outcome(watch, Some(status), elapsed_ms, err.to_string());
+                            return error_outcome(
+                                watch,
+                                engine_used,
+                                Some(status_code),
+                                elapsed_ms,
+                                err.to_string(),
+                            );
                         }
                         CheckOutcome {
                             watch_id: watch.id.clone(),
                             watch_name: watch.display_name().to_string(),
                             url: watch.url.clone(),
+                            engine_used: engine_used.to_string(),
                             status: CheckStatus::Unchanged,
-                            status_code: Some(status),
+                            status_code: Some(status_code),
                             elapsed_ms,
                             previous_value: Some(prev.extracted_text),
-                            current_value: Some(extracted),
+                            current_value: Some(extracted_text),
                             numeric_value,
                             numeric_delta: None,
                             diff: None,
@@ -317,26 +338,33 @@ impl MonitorEngine {
                             .store
                             .record_snapshot(&record, config.defaults.max_history)
                         {
-                            return error_outcome(watch, Some(status), elapsed_ms, err.to_string());
+                            return error_outcome(
+                                watch,
+                                engine_used,
+                                Some(status_code),
+                                elapsed_ms,
+                                err.to_string(),
+                            );
                         }
 
                         let delta = match (prev.numeric_value, numeric_value) {
                             (Some(p), Some(c)) => Some(compute_delta(p, c)),
                             _ => None,
                         };
-                        let diff = compute_diff(&prev.extracted_text, &extracted, 3);
+                        let diff = compute_diff(&prev.extracted_text, &extracted_text, 3);
 
                         let eval = match evaluate_conditions(
                             &watch.conditions,
                             &prev.extracted_text,
-                            &extracted,
+                            &extracted_text,
                             delta.as_ref(),
                         ) {
                             Ok(res) => res,
                             Err(err) => {
                                 return error_outcome(
                                     watch,
-                                    Some(status),
+                                    engine_used,
+                                    Some(status_code),
                                     elapsed_ms,
                                     err.to_string(),
                                 )
@@ -348,11 +376,12 @@ impl MonitorEngine {
                                 watch_id: watch.id.clone(),
                                 watch_name: watch.display_name().to_string(),
                                 url: watch.url.clone(),
+                                engine_used: engine_used.to_string(),
                                 status: CheckStatus::RuleNotMet,
-                                status_code: Some(status),
+                                status_code: Some(status_code),
                                 elapsed_ms,
                                 previous_value: Some(prev.extracted_text),
-                                current_value: Some(extracted),
+                                current_value: Some(extracted_text),
                                 numeric_value,
                                 numeric_delta: delta,
                                 diff: Some(diff),
@@ -370,7 +399,7 @@ impl MonitorEngine {
                                 url: watch.url.clone(),
                                 checked_at,
                                 previous_value: prev.extracted_text.clone(),
-                                current_value: extracted.clone(),
+                                current_value: extracted_text.clone(),
                                 numeric_delta: delta.clone(),
                                 diff_summary: diff.summary.clone(),
                                 diff: diff.unified.clone(),
@@ -385,11 +414,12 @@ impl MonitorEngine {
                             watch_id: watch.id.clone(),
                             watch_name: watch.display_name().to_string(),
                             url: watch.url.clone(),
+                            engine_used: engine_used.to_string(),
                             status: CheckStatus::Changed,
-                            status_code: Some(status),
+                            status_code: Some(status_code),
                             elapsed_ms,
                             previous_value: Some(prev.extracted_text),
-                            current_value: Some(extracted),
+                            current_value: Some(extracted_text),
                             numeric_value,
                             numeric_delta: delta,
                             diff: Some(diff),
@@ -462,8 +492,149 @@ impl MonitorEngine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_extract(
+    fetcher: &HttpFetcher,
+    url: &str,
+    method: HttpMethod,
+    headers: &BTreeMap<String, String>,
+    user_agent: &str,
+    timeout_secs: u64,
+    retries: usize,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    extractor: &ExtractorConfig,
+    ignore_regex: &[String],
+    normalize: &NormalizeConfig,
+    engine: FetchEngine,
+    browser: &BrowserConfig,
+) -> Result<FetchExtractOutcome> {
+    if engine == FetchEngine::Browser {
+        let rendered = render_via_browser(url, timeout_secs, user_agent, headers, browser).await?;
+        let extracted_text = extract_content(
+            &rendered.html,
+            200,
+            &BTreeMap::new(),
+            extractor,
+            ignore_regex,
+            normalize,
+        )?;
+        return Ok(FetchExtractOutcome::Extracted {
+            status_code: 200,
+            etag: None,
+            last_modified: None,
+            extracted_text,
+            elapsed_ms: rendered.elapsed_ms,
+            engine_used: "browser",
+        });
+    }
+
+    let output = fetcher
+        .fetch(FetchRequest {
+            url,
+            method,
+            headers,
+            user_agent,
+            timeout: Duration::from_secs(timeout_secs.max(1)),
+            retries,
+            etag,
+            last_modified,
+        })
+        .await?;
+
+    let (status, resp_headers, body, etag, last_modified, elapsed_ms) = match output {
+        FetchOutput::NotModified { elapsed_ms } => {
+            return Ok(FetchExtractOutcome::NotModified { elapsed_ms });
+        }
+        FetchOutput::Response {
+            status,
+            headers,
+            body,
+            etag,
+            last_modified,
+            elapsed_ms,
+        } => (status, headers, body, etag, last_modified, elapsed_ms),
+    };
+
+    if status >= 400 && !matches!(extractor, ExtractorConfig::Status { .. }) {
+        return Err(Error::Http(format!("HTTP {status} returned from '{url}'")));
+    }
+
+    let http_extract = extract_content(
+        &body,
+        status,
+        &resp_headers,
+        extractor,
+        ignore_regex,
+        normalize,
+    );
+
+    if engine == FetchEngine::Auto && !matches!(extractor, ExtractorConfig::Status { .. }) {
+        let needs_browser = looks_like_spa_shell(&body)
+            || match &http_extract {
+                Ok(text) => text.trim().is_empty(),
+                Err(Error::Extract(_)) => true,
+                Err(_) => false,
+            };
+
+        if needs_browser {
+            debug!(url = %url, "auto engine falling back to headless browser");
+            let rendered =
+                render_via_browser(url, timeout_secs, user_agent, headers, browser).await?;
+            let extracted_text = extract_content(
+                &rendered.html,
+                status,
+                &resp_headers,
+                extractor,
+                ignore_regex,
+                normalize,
+            )?;
+            return Ok(FetchExtractOutcome::Extracted {
+                status_code: status,
+                etag,
+                last_modified,
+                extracted_text,
+                elapsed_ms: elapsed_ms + rendered.elapsed_ms,
+                engine_used: "browser",
+            });
+        }
+    }
+
+    let extracted_text = http_extract?;
+    Ok(FetchExtractOutcome::Extracted {
+        status_code: status,
+        etag,
+        last_modified,
+        extracted_text,
+        elapsed_ms,
+        engine_used: "http",
+    })
+}
+
+async fn render_via_browser(
+    url: &str,
+    timeout_secs: u64,
+    user_agent: &str,
+    headers: &BTreeMap<String, String>,
+    browser: &BrowserConfig,
+) -> Result<webdelta_browser::RenderedPage> {
+    let opts = BrowserOptions {
+        cdp_url: browser.cdp_url.as_deref().map(expand_env_vars),
+        executable_path: None,
+        wait_for_selector: browser.wait_for_selector.clone(),
+        wait_ms: browser.wait_ms.unwrap_or(0),
+        timeout_secs: timeout_secs.max(10),
+        user_agent: Some(user_agent.to_string()),
+        headers: headers.clone(),
+    };
+    render_page(url, &opts)
+        .await
+        .map_err(|err| Error::Http(format!("browser render error: {err}")))
+}
+
 fn error_outcome(
     watch: &WatchConfig,
+    engine_used: &str,
     status_code: Option<u16>,
     elapsed_ms: u64,
     message: String,
@@ -472,6 +643,7 @@ fn error_outcome(
         watch_id: watch.id.clone(),
         watch_name: watch.display_name().to_string(),
         url: watch.url.clone(),
+        engine_used: engine_used.to_string(),
         status: CheckStatus::Error,
         status_code,
         elapsed_ms,
